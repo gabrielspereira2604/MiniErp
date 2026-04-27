@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "dgSpecHash": "J3niCiU1nIM=",
+  "success": true,
+  "projectFilePath": "C:\\Users\\gabri\\source\\repos\\MiniErp\\src\\Services\\FinancialService\\FinancialService.Api\\FinancialService.Api.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\gabri\\.nuget\\packages\\microsoft.aspnetcore.openapi\\9.0.8\\microsoft.aspnetcore.openapi.9.0.8.nupkg.sha512",
+    "C:\\Users\\gabri\\.nuget\\packages\\microsoft.openapi\\1.6.17\\microsoft.openapi.1.6.17.nupkg.sha512"
+  ],
+  "logs": []
+}
