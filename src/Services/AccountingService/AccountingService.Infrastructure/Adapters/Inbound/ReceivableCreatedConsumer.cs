@@ -6,6 +6,8 @@ using MediatR;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Polly;
+using Polly.Retry;
 
 namespace AccountingService.Infrastructure.Adapters.Inbound;
 
@@ -14,6 +16,7 @@ public class ReceivableCreatedConsumer : BackgroundService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<ReceivableCreatedConsumer> _logger;
     private readonly string _bootstrapServers;
+    private readonly ResiliencePipeline _retryPipeline;
 
     public ReceivableCreatedConsumer(
         IServiceScopeFactory scopeFactory,
@@ -23,6 +26,23 @@ public class ReceivableCreatedConsumer : BackgroundService
         _scopeFactory = scopeFactory;
         _logger = logger;
         _bootstrapServers = bootstrapServers;
+        _retryPipeline = new ResiliencePipelineBuilder()
+            .AddRetry(new RetryStrategyOptions
+            {
+                MaxRetryAttempts = 5,
+                Delay = TimeSpan.FromSeconds(1),
+                BackoffType = DelayBackoffType.Exponential,
+                UseJitter = true,
+                ShouldHandle = new PredicateBuilder().Handle<Exception>(ex => ex is not OperationCanceledException),
+                OnRetry = args =>
+                {
+                    _logger.LogWarning(
+                        "Retry {Attempt} processing receivable.created — {Exception}",
+                        args.AttemptNumber, args.Outcome.Exception?.Message);
+                    return ValueTask.CompletedTask;
+                }
+            })
+            .Build();
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -56,15 +76,18 @@ public class ReceivableCreatedConsumer : BackgroundService
                 var payload = JsonSerializer.Deserialize<ReceivableCreatedPayload>(result.Message.Value);
                 if (payload is null) continue;
 
-                using var scope = _scopeFactory.CreateScope();
-                var mediator = scope.ServiceProvider.GetRequiredService<IMediator>();
+                await _retryPipeline.ExecuteAsync(async ct =>
+                {
+                    using var scope = _scopeFactory.CreateScope();
+                    var mediator = scope.ServiceProvider.GetRequiredService<IMediator>();
 
-                await mediator.Send(new CreateLedgerEntryCommand(
-                    payload.ReceivableId,
-                    payload.Amount,
-                    payload.Currency,
-                    correlationId
-                ), stoppingToken);
+                    await mediator.Send(new CreateLedgerEntryCommand(
+                        payload.ReceivableId,
+                        payload.Amount,
+                        payload.Currency,
+                        correlationId
+                    ), ct);
+                }, stoppingToken);
 
                 consumer.Commit(result);
             }
@@ -74,8 +97,7 @@ public class ReceivableCreatedConsumer : BackgroundService
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Error processing receivable.created message");
-                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+                _logger.LogError(ex, "Failed all retries processing receivable.created — message will be redelivered by Kafka");
             }
         }
 
