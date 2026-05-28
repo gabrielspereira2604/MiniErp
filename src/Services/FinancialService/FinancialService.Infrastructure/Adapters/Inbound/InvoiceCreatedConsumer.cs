@@ -9,6 +9,7 @@ using Microsoft.Extensions.Logging;
 using Polly;
 using Polly.CircuitBreaker;
 using Polly.Retry;
+using StackExchange.Redis;
 
 namespace FinancialService.Infrastructure.Adapters.Inbound;
 
@@ -17,20 +18,25 @@ public class InvoiceCreatedConsumer : BackgroundService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<InvoiceCreatedConsumer> _logger;
     private readonly string _bootstrapServers;
+    private readonly IConnectionMultiplexer _redis;
     private readonly ResiliencePipeline _pipeline;
+
+    private const string DlqTopic = "invoice.created.dlq";
+    private const int DlqThreshold = 3;
 
     public InvoiceCreatedConsumer(
         IServiceScopeFactory scopeFactory,
         ILogger<InvoiceCreatedConsumer> logger,
-        string bootstrapServers)
+        string bootstrapServers,
+        IConnectionMultiplexer redis)
     {
         _scopeFactory = scopeFactory;
         _logger = logger;
         _bootstrapServers = bootstrapServers;
+        _redis = redis;
         _pipeline = new ResiliencePipelineBuilder()
             .AddCircuitBreaker(new CircuitBreakerStrategyOptions
             {
-                // abre se 50% das chamadas falharem em uma janela de 30s (mínimo 5 chamadas)
                 FailureRatio = 0.5,
                 MinimumThroughput = 5,
                 SamplingDuration = TimeSpan.FromSeconds(30),
@@ -87,11 +93,13 @@ public class InvoiceCreatedConsumer : BackgroundService
 
         _logger.LogInformation("InvoiceCreatedConsumer started, listening to invoice.created");
 
+        ConsumeResult<string, string>? result = null;
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                var result = consumer.Consume(stoppingToken);
+                result = consumer.Consume(stoppingToken);
                 if (result is null) continue;
 
                 var correlationId = GetHeader(result.Message.Headers, "correlation-id");
@@ -117,6 +125,9 @@ public class InvoiceCreatedConsumer : BackgroundService
                 }, stoppingToken);
 
                 consumer.Commit(result);
+
+                // limpa contador de tentativas ao processar com sucesso
+                await _redis.GetDatabase().KeyDeleteAsync($"dlq:attempts:financial:{result.TopicPartitionOffset}");
             }
             catch (OperationCanceledException)
             {
@@ -131,11 +142,45 @@ public class InvoiceCreatedConsumer : BackgroundService
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Failed all retries processing invoice.created — message will be redelivered by Kafka");
+                if (result is null) continue;
+
+                var redisKey = $"dlq:attempts:financial:{result.TopicPartitionOffset}";
+                var db = _redis.GetDatabase();
+                var attempts = await db.StringIncrementAsync(redisKey);
+                await db.KeyExpireAsync(redisKey, TimeSpan.FromDays(1));
+
+                if (attempts >= DlqThreshold)
+                {
+                    await PublishToDlqAsync(result);
+                    consumer.Commit(result);
+                    await db.KeyDeleteAsync(redisKey);
+                    _logger.LogError(ex,
+                        "Message sent to DLQ after {Attempts} failed deliveries — offset {Offset}",
+                        attempts, result.Offset);
+                }
+                else
+                {
+                    _logger.LogError(ex,
+                        "Failed all retries ({Attempts}/{Threshold}) — Kafka will redeliver offset {Offset}",
+                        attempts, DlqThreshold, result.Offset);
+                }
             }
         }
 
         consumer.Close();
+    }
+
+    private async Task PublishToDlqAsync(ConsumeResult<string, string> original)
+    {
+        var producerConfig = new ProducerConfig { BootstrapServers = _bootstrapServers };
+        using var producer = new ProducerBuilder<string, string>(producerConfig).Build();
+
+        await producer.ProduceAsync(DlqTopic, new Message<string, string>
+        {
+            Key = original.Message.Key,
+            Value = original.Message.Value,
+            Headers = original.Message.Headers
+        });
     }
 
     private static string GetHeader(Headers headers, string key)
