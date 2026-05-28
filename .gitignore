@@ -60,3 +60,7 @@ appsettings.Local.json
 
 ## Docker
 docker-compose.override.yml
+
+## Claude Code
+CLAUDE.md
+.claude/
