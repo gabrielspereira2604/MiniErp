@@ -1,41 +1,43 @@
+using InvoiceService.Api.Middleware;
+using InvoiceService.Application.Commands.CreateInvoice;
+using InvoiceService.Domain.Ports;
+using InvoiceService.Infrastructure.Adapters.Outbound.Messaging;
+using InvoiceService.Infrastructure.Adapters.Outbound.Outbox;
+using InvoiceService.Infrastructure.Adapters.Outbound.Persistence;
+using MediatR;
+using Microsoft.EntityFrameworkCore;
+
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
-// Learn more about configuring OpenAPI at https://aka.ms/aspnet/openapi
+builder.Services.AddControllers();
 builder.Services.AddOpenApi();
+
+// MediatR
+builder.Services.AddMediatR(cfg =>
+    cfg.RegisterServicesFromAssembly(typeof(CreateInvoiceHandler).Assembly));
+
+// EF Core + PostgreSQL
+builder.Services.AddDbContext<InvoiceDbContext>(options =>
+    options.UseNpgsql(builder.Configuration.GetConnectionString("InvoiceDb")));
+
+// Repositório
+builder.Services.AddScoped<IInvoiceRepository, InvoiceRepository>();
+
+// Kafka Producer
+var kafkaBootstrapServers = builder.Configuration["Kafka:BootstrapServers"] ?? "localhost:9092";
+builder.Services.AddSingleton<IEventPublisher>(sp =>
+    new KafkaEventPublisher(kafkaBootstrapServers, sp.GetRequiredService<ILogger<KafkaEventPublisher>>()));
+
+// Outbox Worker
+builder.Services.AddHostedService<OutboxWorker>();
 
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
-{
     app.MapOpenApi();
-}
 
+app.UseMiddleware<CorrelationIdMiddleware>();
 app.UseHttpsRedirection();
-
-var summaries = new[]
-{
-    "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
-};
-
-app.MapGet("/weatherforecast", () =>
-{
-    var forecast =  Enumerable.Range(1, 5).Select(index =>
-        new WeatherForecast
-        (
-            DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
-            Random.Shared.Next(-20, 55),
-            summaries[Random.Shared.Next(summaries.Length)]
-        ))
-        .ToArray();
-    return forecast;
-})
-.WithName("GetWeatherForecast");
+app.MapControllers();
 
 app.Run();
-
-record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
-{
-    public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
-}
