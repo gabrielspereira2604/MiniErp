@@ -7,6 +7,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Polly;
+using Polly.CircuitBreaker;
 using Polly.Retry;
 
 namespace AccountingService.Infrastructure.Adapters.Inbound;
@@ -16,7 +17,7 @@ public class ReceivableCreatedConsumer : BackgroundService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<ReceivableCreatedConsumer> _logger;
     private readonly string _bootstrapServers;
-    private readonly ResiliencePipeline _retryPipeline;
+    private readonly ResiliencePipeline _pipeline;
 
     public ReceivableCreatedConsumer(
         IServiceScopeFactory scopeFactory,
@@ -26,7 +27,32 @@ public class ReceivableCreatedConsumer : BackgroundService
         _scopeFactory = scopeFactory;
         _logger = logger;
         _bootstrapServers = bootstrapServers;
-        _retryPipeline = new ResiliencePipelineBuilder()
+        _pipeline = new ResiliencePipelineBuilder()
+            .AddCircuitBreaker(new CircuitBreakerStrategyOptions
+            {
+                FailureRatio = 0.5,
+                MinimumThroughput = 5,
+                SamplingDuration = TimeSpan.FromSeconds(30),
+                BreakDuration = TimeSpan.FromSeconds(30),
+                ShouldHandle = new PredicateBuilder().Handle<Exception>(ex => ex is not OperationCanceledException),
+                OnOpened = args =>
+                {
+                    _logger.LogError(
+                        "Circuit breaker OPENED — receivable.created processing paused for {BreakDuration}s",
+                        args.BreakDuration.TotalSeconds);
+                    return ValueTask.CompletedTask;
+                },
+                OnClosed = args =>
+                {
+                    _logger.LogInformation("Circuit breaker CLOSED — receivable.created processing resumed");
+                    return ValueTask.CompletedTask;
+                },
+                OnHalfOpened = args =>
+                {
+                    _logger.LogWarning("Circuit breaker HALF-OPEN — testing receivable.created processing");
+                    return ValueTask.CompletedTask;
+                }
+            })
             .AddRetry(new RetryStrategyOptions
             {
                 MaxRetryAttempts = 5,
@@ -76,7 +102,7 @@ public class ReceivableCreatedConsumer : BackgroundService
                 var payload = JsonSerializer.Deserialize<ReceivableCreatedPayload>(result.Message.Value);
                 if (payload is null) continue;
 
-                await _retryPipeline.ExecuteAsync(async ct =>
+                await _pipeline.ExecuteAsync(async ct =>
                 {
                     using var scope = _scopeFactory.CreateScope();
                     var mediator = scope.ServiceProvider.GetRequiredService<IMediator>();
