@@ -122,6 +122,13 @@ public class InvoiceCreatedConsumer : BackgroundService
             {
                 break;
             }
+            catch (BrokenCircuitException)
+            {
+                // fallback: CB aberto — não commita o offset, Kafka reentrega quando o serviço voltar
+                _logger.LogWarning(
+                    "Fallback — circuit breaker open, invoice.created message will be redelivered by Kafka");
+                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Failed all retries processing invoice.created — message will be redelivered by Kafka");
